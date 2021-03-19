@@ -398,6 +398,10 @@ abstract class AbstractMessageListenerContainer
 			return this.hasRedrivePolicy;
 		}
 
+		public Integer getMaxNumberOfMessages() {
+			return maxNumberOfMessages;
+		}
+
 		public ReceiveMessageRequest getReceiveMessageRequest() {
 			ReceiveMessageRequest receiveMessageRequest = new ReceiveMessageRequest(this.destinationUrl)
 					.withAttributeNames(RECEIVING_ATTRIBUTES).withMessageAttributeNames(RECEIVING_MESSAGE_ATTRIBUTES);

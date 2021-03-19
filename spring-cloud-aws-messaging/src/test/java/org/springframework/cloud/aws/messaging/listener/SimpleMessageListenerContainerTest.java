@@ -191,7 +191,7 @@ class SimpleMessageListenerContainerTest {
 
 		container.afterPropertiesSet();
 
-		int expectedPoolMaxSize = messageHandlerMethods.size() * (testedMaxNumberOfMessages + 1);
+		int expectedPoolMaxSize = messageHandlerMethods.size() * (testedMaxNumberOfMessages + 2);
 
 		ThreadPoolTaskExecutor taskExecutor = (ThreadPoolTaskExecutor) container.getTaskExecutor();
 		assertThat(taskExecutor).isNotNull();
@@ -948,24 +948,36 @@ class SimpleMessageListenerContainerTest {
 		container.afterPropertiesSet();
 		container.start();
 
-		assertThat(container.isRunning("testQueue")).isTrue();
-		assertThat(container.isRunning("anotherTestQueue")).isTrue();
+		assertThat(container.isRunningListener("testQueue")).isTrue();
+		assertThat(container.isRunningProcessor("testQueue")).isTrue();
+		assertThat(container.isRunningListener("anotherTestQueue")).isTrue();
+		assertThat(container.isRunningProcessor("anotherTestQueue")).isTrue();
 
 		// Act
 		container.stop("testQueue");
+		long blockingQueuePollWaitMs = container.getBlockingQueuePollWaitMs();
+		long queueStopTimeout = container.getQueueStopTimeout();
+		// System.out.println("queueStopTimeout["+queueStopTimeout+"]
+		// blockingQueuePollWaitMs["+blockingQueuePollWaitMs+ "]");
+
+		// We need to wait at least X milliseconds for the poller to finish spinning
 
 		// Assert
-		assertThat(container.isRunning("testQueue")).isFalse();
-		assertThat(container.isRunning("anotherTestQueue")).isTrue();
+		assertThat(container.isRunningListener("testQueue")).isFalse();
+		assertThat(container.isRunningProcessor("testQueue")).isFalse();
+		assertThat(container.isRunningListener("anotherTestQueue")).isTrue();
+		assertThat(container.isRunningProcessor("anotherTestQueue")).isTrue();
 
 		container.stop();
 
-		assertThat(container.isRunning("testQueue")).isFalse();
-		assertThat(container.isRunning("anotherTestQueue")).isFalse();
+		assertThat(container.isRunningListener("testQueue")).isFalse();
+		assertThat(container.isRunningProcessor("testQueue")).isFalse();
+		assertThat(container.isRunningListener("anotherTestQueue")).isFalse();
+		assertThat(container.isRunningProcessor("anotherTestQueue")).isFalse();
 	}
 
 	@Test
-	void stopAndStart_withContainerHavingARunningQueue_shouldRestartTheSpecifiedQueue() throws Exception {
+	void stopAndStart_withContainerHavingARunningdQueue_shouldRestartTheSpecifiedQueue() throws Exception {
 		// Arrange
 		StaticApplicationContext applicationContext = new StaticApplicationContext();
 		applicationContext.registerSingleton("testMessageListener", TestMessageListener.class);
@@ -986,8 +998,10 @@ class SimpleMessageListenerContainerTest {
 		container.start();
 		container.stop("testQueue");
 
-		assertThat(container.isRunning("testQueue")).isFalse();
-		assertThat(container.isRunning("anotherTestQueue")).isTrue();
+		assertThat(container.isRunningListener("testQueue")).isFalse();
+		assertThat(container.isRunningProcessor("testQueue")).isFalse();
+		assertThat(container.isRunningListener("anotherTestQueue")).isTrue();
+		assertThat(container.isRunningProcessor("anotherTestQueue")).isTrue();
 
 		sqs.setReceiveMessageEnabled(true);
 
@@ -995,17 +1009,21 @@ class SimpleMessageListenerContainerTest {
 		container.start("testQueue");
 
 		// Assert
-		assertThat(container.isRunning("testQueue")).isTrue();
-		assertThat(container.isRunning("anotherTestQueue")).isTrue();
+		assertThat(container.isRunningListener("testQueue")).isTrue();
+		assertThat(container.isRunningProcessor("testQueue")).isTrue();
+		assertThat(container.isRunningListener("anotherTestQueue")).isTrue();
+		assertThat(container.isRunningProcessor("anotherTestQueue")).isTrue();
 
 		TestMessageListener testMessageListener = applicationContext.getBean(TestMessageListener.class);
-		boolean await = testMessageListener.getCountDownLatch().await(1, TimeUnit.SECONDS);
+		boolean await = testMessageListener.getCountDownLatch().await(10, TimeUnit.SECONDS);
 		assertThat(await).isTrue();
 		assertThat(testMessageListener.getMessage()).isEqualTo("Hello");
 		container.stop();
 
-		assertThat(container.isRunning("testQueue")).isFalse();
-		assertThat(container.isRunning("anotherTestQueue")).isFalse();
+		assertThat(container.isRunningListener("testQueue")).isFalse();
+		assertThat(container.isRunningProcessor("testQueue")).isFalse();
+		assertThat(container.isRunningListener("anotherTestQueue")).isFalse();
+		assertThat(container.isRunningProcessor("anotherTestQueue")).isFalse();
 	}
 
 	@Test
@@ -1062,13 +1080,15 @@ class SimpleMessageListenerContainerTest {
 		container.afterPropertiesSet();
 		container.start();
 
-		assertThat(container.isRunning("testQueue")).isTrue();
+		assertThat(container.isRunningListener("testQueue")).isTrue();
+		assertThat(container.isRunningProcessor("testQueue")).isTrue();
 
 		// Act
 		container.start("testQueue");
 
 		// Assert
-		assertThat(container.isRunning("testQueue")).isTrue();
+		assertThat(container.isRunningListener("testQueue")).isTrue();
+		assertThat(container.isRunningProcessor("testQueue")).isTrue();
 
 		container.stop();
 	}
@@ -1098,13 +1118,15 @@ class SimpleMessageListenerContainerTest {
 		container.start();
 
 		container.stop("testQueue");
-		assertThat(container.isRunning("testQueue")).isFalse();
+		assertThat(container.isRunningListener("testQueue")).isFalse();
+		assertThat(container.isRunningProcessor("testQueue")).isFalse();
 
 		// Act
 		container.stop("testQueue");
 
 		// Assert
-		assertThat(container.isRunning("testQueue")).isFalse();
+		assertThat(container.isRunningListener("testQueue")).isFalse();
+		assertThat(container.isRunningProcessor("testQueue")).isFalse();
 	}
 
 	@Test
@@ -1145,7 +1167,10 @@ class SimpleMessageListenerContainerTest {
 		// Assert
 		assertThat(container.getQueueStopTimeout()).isEqualTo(100);
 		assertThat(stopWatch.getTotalTimeMillis() >= container.getQueueStopTimeout())
-				.as("stop must last at least the defined queue stop timeout (> 100ms)").isTrue();
+				.as("stop must last at least the defined queue stop timeout (> 100ms) stopWatch["
+						+ stopWatch.getTotalTimeMillis() + "] > containerStopTime[" + container.getQueueStopTimeout()
+						+ "]")
+				.isTrue();
 		assertThat(stopWatch.getTotalTimeMillis() < LongRunningListenerMethod.LISTENER_METHOD_WAIT_TIME)
 				.as("stop must last less than the listener method (< 20000ms)").isTrue();
 		container.stop();

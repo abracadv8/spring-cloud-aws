@@ -16,12 +16,18 @@
 
 package org.springframework.cloud.aws.messaging.listener;
 
+import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Future;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 
@@ -38,6 +44,46 @@ import org.springframework.util.ClassUtils;
 import static org.springframework.cloud.aws.messaging.core.QueueMessageUtils.createMessage;
 
 /**
+ * Ugly hack.
+ *
+ * The current implementation is that there is one polling thread in a loop:
+ * 1 - Poll for 10 items, create a coundownlatch(10)
+ * 2 - Pass them off to the executing thread (this could be a thread pool/executor service)
+ * 3 - Count down via the latch as items are processed
+ * 4 - When all 10 are processed, repeat
+ *
+ * The main limitation is that the polling takes place in a single-threaded loop;
+ * even if the items were processed instantaneously (0 nanoseconds), the implementation
+ * is still bounded by however long it takes to poll the messages.  Eg, if the polling
+ * API has 100ms of latency with instantaneous processing, the fastest you could process
+ * is 10 messages / 100ms (or 100 messages / second).  Additional, the max threads you could
+ * have would be 11 (this thread, plus the 10 task executors = one for each of the 10 messages
+ * being polled).  This basically means you can only achieve a max concurrency of 10.
+ *
+ *
+ * Below is a way to decouple the execution threads from the polling threads with a shared blocking queue
+ * as the interface between them.  This way you could have multiple threads polling for 10 messages
+ * at the same time and adding to the queue until it reaches capacity and then blocks the pollers until the
+ * processing threads consume them. The blocking queue is fair so multiple pollers should all theoretically
+ * get a fair chance at adding their items so none of the polling threads should starve or not be able to
+ * make progress.
+ *
+ * The default is to have 1 poller such that it should behave somewhat similarly to the
+ * original, however, this also means that it uses at least one additional thread than
+ * the original does.
+ *
+ * It almost always makes sense to have 2-3 pollers minimum; with just 1 poller, when it performs
+ * the poll, even with just 100ms network latency, that is time the executor threads are idle,
+ * without work to do.
+ *
+ * Some sample settings might be to:
+ * - messages set to 10 (poll 10 messages at a time)
+ * - set 3 pollers (so it is less likely executors are idle)
+ * - a blocking queue size of pollers * message = 25-30 (each of the 3 pollers can add to the queue without blocking one another)
+ * - Create your own ThreadExecutor with 10-30 threads to asyncrhonously process.
+ *
+ *
+ *
  * @author Agim Emruli
  * @author Alain Sahli
  * @author Mete Alpaslan Katırcıoğlu
@@ -45,7 +91,8 @@ import static org.springframework.cloud.aws.messaging.core.QueueMessageUtils.cre
  */
 public class SimpleMessageListenerContainer extends AbstractMessageListenerContainer {
 
-	private static final int DEFAULT_WORKER_THREADS = 2;
+	// A few extra threads to handle submitting cleanup tasks
+	private static final int DEFAULT_WORKER_THREADS = 3;
 
 	private static final String DEFAULT_THREAD_NAME_PREFIX = ClassUtils
 			.getShortName(SimpleMessageListenerContainer.class) + "-";
@@ -56,9 +103,19 @@ public class SimpleMessageListenerContainer extends AbstractMessageListenerConta
 
 	private long queueStopTimeout = 20000;
 
+	private int blockingQueueMaxSize = 10;
+
+	private int blockingQueuePollWaitMs = 25;
+
+	private int pollerCount = 1;
+
 	private AsyncTaskExecutor taskExecutor;
 
-	private ConcurrentHashMap<String, Future<?>> scheduledFutureByQueue;
+	private ConcurrentHashMap<String, CountDownLatch> scheduledFutureByQueueListenerShutdown;
+
+	private ConcurrentHashMap<String, List<Future<?>>> scheduledFutureByQueueListener;
+
+	private ConcurrentHashMap<String, Future<?>> scheduledFutureByQueueProcessor;
 
 	private ConcurrentHashMap<String, Boolean> runningStateByQueue;
 
@@ -85,6 +142,56 @@ public class SimpleMessageListenerContainer extends AbstractMessageListenerConta
 	 */
 	public void setBackOffTime(long backOffTime) {
 		this.backOffTime = backOffTime;
+	}
+
+	/**
+	 * Get the number of polling threads created.
+	 * @return The number of polling threads
+	 */
+	public int getPollerCount() {
+		return pollerCount;
+	}
+
+	/**
+	 * Sets the number of polling threads.
+	 * @param pollerCount
+	 */
+	public void setPollerCount(int pollerCount) {
+		Assert.isTrue(pollerCount > 0, "There must be at least 1 polling thread");
+		this.pollerCount = pollerCount;
+	}
+
+	/**
+	 * Returns the blocking queue size.
+	 * @return The blocking queue size
+	 */
+	public int getBlockingQueueMaxSize() {
+		return blockingQueueMaxSize;
+	}
+
+	/**
+	 * The max size of the queue. All of the polling threads will eagerly try to block and fill it up.
+	 * @param blockingQueueMaxSize The max size of the queue.
+	 */
+	public void setBlockingQueueMaxSize(int blockingQueueMaxSize) {
+		this.blockingQueueMaxSize = blockingQueueMaxSize;
+	}
+
+	/**
+	 * How long the execution threads should wait when polling the blocking queue.  Lower values
+	 * will mean more contention.  The executor shouldn't have that much time popping items of
+	 * the blocking queue so this doesnt need to be set very low or high.
+	 * @return How long for executors to poll-loop when the queue is blocked
+	 */
+	public int getBlockingQueuePollWaitMs() {
+		return blockingQueuePollWaitMs;
+	}
+	/**
+	 * Sets the polling queue wait time for items to become available.
+	 * @param blockingQueuePollWaitMs How long executors will wait for an item in the queue.
+	 */
+	public void setBlockingQueuePollWaitMs(int blockingQueuePollWaitMs) {
+		this.blockingQueuePollWaitMs = blockingQueuePollWaitMs;
 	}
 
 	/**
@@ -117,7 +224,9 @@ public class SimpleMessageListenerContainer extends AbstractMessageListenerConta
 		}
 
 		initializeRunningStateByQueue();
-		this.scheduledFutureByQueue = new ConcurrentHashMap<>(getRegisteredQueues().size());
+		this.scheduledFutureByQueueListener = new ConcurrentHashMap<>(getRegisteredQueues().size());
+		this.scheduledFutureByQueueProcessor = new ConcurrentHashMap<>(getRegisteredQueues().size());
+		this.scheduledFutureByQueueListenerShutdown = new ConcurrentHashMap<>(getRegisteredQueues().size());
 	}
 
 	private void initializeRunningStateByQueue() {
@@ -141,21 +250,44 @@ public class SimpleMessageListenerContainer extends AbstractMessageListenerConta
 	}
 
 	private void notifyRunningQueuesToStop() {
+		getLogger().debug("Stopping notifyRunningQueuesToStop called");
 		for (Map.Entry<String, Boolean> runningStateByQueue : this.runningStateByQueue.entrySet()) {
 			if (runningStateByQueue.getValue()) {
 				stopQueue(runningStateByQueue.getKey());
 			}
 		}
+		getLogger().debug("Stopping notifyRunningQueuesToStop called complete");
 	}
 
-	private void waitForRunningQueuesToStop() {
-		for (Map.Entry<String, Boolean> queueRunningState : this.runningStateByQueue.entrySet()) {
-			String logicalQueueName = queueRunningState.getKey();
-			Future<?> queueSpinningThread = this.scheduledFutureByQueue.get(logicalQueueName);
+	private void waitForRunningQueueToStop(String logicalName) {
+		String logicalQueueName = logicalName;
+		List<Future<?>> listeners = this.scheduledFutureByQueueListener.get(logicalQueueName);
+		Future<?> processors = this.scheduledFutureByQueueProcessor.get(logicalQueueName);
 
-			if (queueSpinningThread != null) {
+		List<Future<?>> listToStop = new ArrayList<>();
+		if (listeners != null) {
+			listToStop.addAll(listeners);
+		}
+		if (processors != null) {
+			listToStop.add(processors);
+		}
+
+		// Try to stop all the futures at the same time. If the processors are nearing
+		// stopping, they  should have a few free threads to asynchronously stop the
+		// threads below.
+		// Ex, 10 messages + 5 pollers + 2 running = 17 threads. As messages stop
+		// executing, more threads  can get freed up to stop the work
+		if (listToStop == null || listToStop.isEmpty()) {
+			return;
+		}
+
+		CountDownLatch latch = new CountDownLatch(listToStop.size());
+		for (Future<?> queueSpinningThread : listToStop) {
+			getTaskExecutor().execute(() -> {
 				try {
+					getLogger().debug("Stoppinmg queue[{}] task[{}]", logicalQueueName, queueSpinningThread);
 					queueSpinningThread.get(getQueueStopTimeout(), TimeUnit.MILLISECONDS);
+					latch.countDown();
 				}
 				catch (ExecutionException | TimeoutException e) {
 					getLogger().warn("An exception occurred while stopping queue '" + logicalQueueName + "'", e);
@@ -163,7 +295,21 @@ public class SimpleMessageListenerContainer extends AbstractMessageListenerConta
 				catch (InterruptedException e) {
 					Thread.currentThread().interrupt();
 				}
-			}
+			});
+		}
+		try {
+			latch.await(getQueueStopTimeout(), TimeUnit.MILLISECONDS);
+		}
+		catch (InterruptedException e) {
+			getLogger().warn("An Exception occurred while waiting for queue '{}' to finish processing",
+					logicalQueueName, e);
+		}
+	}
+
+	private void waitForRunningQueuesToStop() {
+		getLogger().debug("Stoppinmg waitForRunningQueuesToStop called");
+		for (Map.Entry<String, Boolean> queueRunningState : this.runningStateByQueue.entrySet()) {
+			waitForRunningQueueToStop(queueRunningState.getKey());
 		}
 	}
 
@@ -192,16 +338,27 @@ public class SimpleMessageListenerContainer extends AbstractMessageListenerConta
 		int spinningThreads = this.getRegisteredQueues().size();
 
 		if (spinningThreads > 0) {
-			threadPoolTaskExecutor.setCorePoolSize(spinningThreads * DEFAULT_WORKER_THREADS);
+			threadPoolTaskExecutor.setCorePoolSize(spinningThreads * DEFAULT_WORKER_THREADS + pollerCount);
 
 			int maxNumberOfMessagePerBatch = getMaxNumberOfMessages() != null ? getMaxNumberOfMessages()
 					: DEFAULT_MAX_NUMBER_OF_MESSAGES;
-			threadPoolTaskExecutor.setMaxPoolSize(spinningThreads * (maxNumberOfMessagePerBatch + 1));
+			threadPoolTaskExecutor.setMaxPoolSize(spinningThreads * (maxNumberOfMessagePerBatch + 1 + pollerCount));
 		}
 
-		// No use of a thread pool executor queue to avoid retaining message to long in
-		// memory
+		// No use of a thread pool executor queue to avoid retaining message too long in memory
 		threadPoolTaskExecutor.setQueueCapacity(0);
+
+		// On rejection, just block that thread until it is able to put a job in the queue
+		threadPoolTaskExecutor.setRejectedExecutionHandler((r, executor) -> {
+			try {
+				// The queue is synchronous
+				executor.getQueue().put(r);
+			}
+			catch (InterruptedException e) {
+				throw new RejectedExecutionException(
+						"InterruptedException while waiting to add  Task to ThreadPoolExecutor queue...", e);
+			}
+		});
 		threadPoolTaskExecutor.afterPropertiesSet();
 
 		return threadPoolTaskExecutor;
@@ -226,21 +383,7 @@ public class SimpleMessageListenerContainer extends AbstractMessageListenerConta
 	 */
 	public void stop(String logicalQueueName) {
 		stopQueue(logicalQueueName);
-
-		try {
-			if (isRunning(logicalQueueName)) {
-				Future<?> future = this.scheduledFutureByQueue.remove(logicalQueueName);
-				if (future != null) {
-					future.get(this.queueStopTimeout, TimeUnit.MILLISECONDS);
-				}
-			}
-		}
-		catch (InterruptedException e) {
-			Thread.currentThread().interrupt();
-		}
-		catch (ExecutionException | TimeoutException e) {
-			getLogger().warn("Error stopping queue with name: '" + logicalQueueName + "'", e);
-		}
+		waitForRunningQueueToStop(logicalQueueName);
 	}
 
 	protected void stopQueue(String logicalQueueName) {
@@ -264,8 +407,28 @@ public class SimpleMessageListenerContainer extends AbstractMessageListenerConta
 	 * @return {@code true} if the spinning thread for the specified queue is running
 	 * otherwise {@code false}.
 	 */
-	public boolean isRunning(String logicalQueueName) {
-		Future<?> future = this.scheduledFutureByQueue.get(logicalQueueName);
+	public boolean isRunningListener(String logicalQueueName) {
+		List<Future<?>> futures = this.scheduledFutureByQueueListener.get(logicalQueueName);
+		if (futures == null) {
+			return false;
+		}
+		for (Future<?> future : futures) {
+			if (!future.isCancelled() && !future.isDone()) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	/**
+	 * Checks if the spinning thread for the specified queue {@code logicalQueueName} is
+	 * still running (polling for new messages) or not.
+	 * @param logicalQueueName the name as defined on the listener method
+	 * @return {@code true} if the spinning thread for the specified queue is running
+	 * otherwise {@code false}.
+	 */
+	public boolean isRunningProcessor(String logicalQueueName) {
+		Future<?> future = this.scheduledFutureByQueueProcessor.get(logicalQueueName);
 		return future != null && !future.isCancelled() && !future.isDone();
 	}
 
@@ -275,8 +438,21 @@ public class SimpleMessageListenerContainer extends AbstractMessageListenerConta
 		}
 
 		this.runningStateByQueue.put(queueName, true);
-		Future<?> future = getTaskExecutor().submit(new AsynchronousMessageListener(queueName, queueAttributes));
-		this.scheduledFutureByQueue.put(queueName, future);
+
+		// The queue will be fair and blocking takes until something is put
+		BlockingQueue<Message> blockingQueue = new ArrayBlockingQueue<>(blockingQueueMaxSize, true);
+		List<Future<?>> futures = new ArrayList<>();
+		this.scheduledFutureByQueueListenerShutdown.put(queueName, new CountDownLatch(pollerCount));
+		for (int i = 0; i < pollerCount; i++) {
+			Future<?> futureListener1 = getTaskExecutor()
+					.submit(new AsynchronousMessageListener(queueName, queueAttributes, blockingQueue));
+			futures.add(futureListener1);
+		}
+
+		this.scheduledFutureByQueueListener.put(queueName, futures);
+		Future<?> futureProc = getTaskExecutor()
+				.submit(new AsynchronousMessageProcessor(queueName, queueAttributes, blockingQueue));
+		this.scheduledFutureByQueueProcessor.put(queueName, futureProc);
 	}
 
 	private static final class SignalExecutingRunnable implements Runnable {
@@ -302,15 +478,42 @@ public class SimpleMessageListenerContainer extends AbstractMessageListenerConta
 
 	}
 
+	private static final class SignalExecutingSemRunnable implements Runnable {
+
+		private final Semaphore countDownLatch;
+
+		private final Runnable runnable;
+
+		private SignalExecutingSemRunnable(Semaphore endSignal, Runnable runnable) {
+			this.countDownLatch = endSignal;
+			this.runnable = runnable;
+		}
+
+		@Override
+		public void run() {
+			try {
+				this.runnable.run();
+			}
+			finally {
+				this.countDownLatch.release();
+			}
+		}
+
+	}
+
 	private final class AsynchronousMessageListener implements Runnable {
 
 		private final QueueAttributes queueAttributes;
 
 		private final String logicalQueueName;
 
-		private AsynchronousMessageListener(String logicalQueueName, QueueAttributes queueAttributes) {
+		private final BlockingQueue<Message> blockingQueue;
+
+		private AsynchronousMessageListener(String logicalQueueName, QueueAttributes queueAttributes,
+				BlockingQueue<Message> blockingQueue) {
 			this.logicalQueueName = logicalQueueName;
 			this.queueAttributes = queueAttributes;
+			this.blockingQueue = blockingQueue;
 		}
 
 		@Override
@@ -319,23 +522,16 @@ public class SimpleMessageListenerContainer extends AbstractMessageListenerConta
 				try {
 					ReceiveMessageResult receiveMessageResult = getAmazonSqs()
 							.receiveMessage(this.queueAttributes.getReceiveMessageRequest());
-					CountDownLatch messageBatchLatch = new CountDownLatch(receiveMessageResult.getMessages().size());
+					// TODO what to do about countdown?
+					getLogger().debug("PollerThread[{}] Got [{}] messages", Thread.currentThread().getName(),
+							receiveMessageResult.getMessages().size());
 					for (Message message : receiveMessageResult.getMessages()) {
-						if (isQueueRunning()) {
-							MessageExecutor messageExecutor = new MessageExecutor(this.logicalQueueName, message,
-									this.queueAttributes);
-							getTaskExecutor().execute(new SignalExecutingRunnable(messageBatchLatch, messageExecutor));
-						}
-						else {
-							messageBatchLatch.countDown();
-						}
+						// Synchronize as the state of the queue could stop running at any point
+						blockingQueue.put(message);
 					}
-					try {
-						messageBatchLatch.await();
-					}
-					catch (InterruptedException e) {
-						Thread.currentThread().interrupt();
-					}
+					getLogger().debug("PollerThread[{}] put [{}] messages - current queue size[{}]",
+							Thread.currentThread().getName(), receiveMessageResult.getMessages().size(),
+							blockingQueue.size());
 				}
 				catch (Exception e) {
 					getLogger().warn("An Exception occurred while polling queue '{}'. The failing operation will be "
@@ -350,7 +546,131 @@ public class SimpleMessageListenerContainer extends AbstractMessageListenerConta
 				}
 			}
 
-			SimpleMessageListenerContainer.this.scheduledFutureByQueue.remove(this.logicalQueueName);
+			SimpleMessageListenerContainer.this.scheduledFutureByQueueListenerShutdown.get(this.logicalQueueName)
+					.countDown();
+			if (SimpleMessageListenerContainer.this.scheduledFutureByQueueListenerShutdown.get(this.logicalQueueName)
+					.getCount() == 0) {
+				SimpleMessageListenerContainer.this.scheduledFutureByQueueListenerShutdown
+						.remove(this.logicalQueueName);
+				SimpleMessageListenerContainer.this.scheduledFutureByQueueListener.remove(this.logicalQueueName);
+			}
+		}
+
+		private boolean isQueueRunning() {
+			if (SimpleMessageListenerContainer.this.runningStateByQueue.containsKey(this.logicalQueueName)) {
+				return SimpleMessageListenerContainer.this.runningStateByQueue.get(this.logicalQueueName);
+			}
+			else {
+				getLogger().warn(
+						"Stopped queue '" + this.logicalQueueName + "' because it was not listed as running queue.");
+				return false;
+			}
+		}
+
+	}
+
+	private final class AsynchronousMessageProcessor implements Runnable {
+
+		private final QueueAttributes queueAttributes;
+
+		private final String logicalQueueName;
+
+		private final BlockingQueue<Message> blockingQueue;
+
+		private AsynchronousMessageProcessor(String logicalQueueName, QueueAttributes queueAttributes,
+				BlockingQueue<Message> blockingQueue) {
+			this.logicalQueueName = logicalQueueName;
+			this.queueAttributes = queueAttributes;
+			this.blockingQueue = blockingQueue;
+		}
+
+		@Override
+		public void run() {
+
+			Semaphore sem = new Semaphore(blockingQueueMaxSize);
+			while (isQueueRunning()) {
+				try {
+					// Don't wait forever, just wait for X seconds so that the queue can  stop running at some point
+					Message message = blockingQueue.poll(blockingQueuePollWaitMs, TimeUnit.MILLISECONDS);
+					if (message != null) {
+						if (isQueueRunning()) {
+							MessageExecutor messageExecutor = new MessageExecutor(this.logicalQueueName, message,
+									this.queueAttributes);
+							sem.acquire();
+							getTaskExecutor().execute(new SignalExecutingSemRunnable(sem, messageExecutor));
+						}
+					}
+				}
+				catch (Exception e) {
+					getLogger().warn("An Exception occurred while executing tasks for queue '{}'",
+							this.logicalQueueName, e);
+				}
+			}
+
+			// If there are still items, try to process them and block anything else from
+			// putting stuff in. Keep track of the total time taken below.
+			long startTime = System.currentTimeMillis();
+			long endTime = startTime;
+			long timeTaken = 0;
+
+			// Making sure the writer has waited for all of its readers to stop
+			CountDownLatch latch = SimpleMessageListenerContainer.this.scheduledFutureByQueueListenerShutdown
+					.get(this.logicalQueueName);
+			if (latch != null) {
+				try {
+					latch.await(queueStopTimeout - timeTaken, TimeUnit.MILLISECONDS);
+					// Calculate total time taken so far
+					endTime = System.currentTimeMillis();
+					timeTaken = endTime - startTime;
+				}
+				catch (InterruptedException e) {
+					getLogger().warn("An Exception occurred while waiting for queue '{}' to finish processing",
+							this.logicalQueueName, e);
+				}
+			}
+
+			// Block until we can get all the semaphores (eg, any processors can now no  longer add to the queue)
+			try {
+				// Block the rest of the queues, taking into account total time taken thus far
+				// (eg, if stop time is 30s, wait for 30s minus whatever time was taken above)
+				sem.tryAcquire(blockingQueueMaxSize, queueStopTimeout - timeTaken, TimeUnit.MILLISECONDS);
+			}
+			catch (InterruptedException e) {
+				getLogger().warn("An Exception occurred while waiting for queue '{}' to finish processing",
+						this.logicalQueueName, e);
+			}
+
+			// Readers should have stopped by now.
+			// No one should be allowed to add to the queue any longer.
+			// Process any remaining values.
+			if (!blockingQueue.isEmpty()) {
+				CountDownLatch messageBatchLatch = new CountDownLatch(blockingQueue.size());
+				// Don't wait forever, just wait for X seconds so that the queue can stop
+				// running at some point
+				try {
+					Message message = blockingQueue.poll(blockingQueuePollWaitMs, TimeUnit.MILLISECONDS);
+					while (message != null) {
+						MessageExecutor messageExecutor = new MessageExecutor(this.logicalQueueName, message,
+								this.queueAttributes);
+						getTaskExecutor().execute(new SignalExecutingRunnable(messageBatchLatch, messageExecutor));
+						message = blockingQueue.poll(blockingQueuePollWaitMs, TimeUnit.MILLISECONDS);
+					}
+
+					// Submit all messages and wait till the
+					messageBatchLatch.await(queueStopTimeout - timeTaken, TimeUnit.MILLISECONDS);
+					endTime = System.currentTimeMillis();
+					timeTaken = endTime - startTime;
+				}
+				catch (InterruptedException e) {
+					Thread.currentThread().interrupt();
+				}
+				catch (Exception e) {
+					getLogger().warn("An Exception occurred while executing tasks for queue '{}'",
+							this.logicalQueueName, e);
+				}
+			}
+
+			SimpleMessageListenerContainer.this.scheduledFutureByQueueProcessor.remove(this.logicalQueueName);
 		}
 
 		private boolean isQueueRunning() {
